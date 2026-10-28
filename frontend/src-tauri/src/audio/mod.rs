@@ -4,6 +4,7 @@ pub mod decoder;
 pub mod encode;
 pub mod ffmpeg;
 pub mod vad;
+pub mod speaker_tracker;
 
 // Modularized device management
 pub mod devices;

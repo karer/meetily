@@ -12,6 +12,7 @@ use super::devices::AudioDevice;
 use super::recording_state::{AudioChunk, AudioError, RecordingState, DeviceType};
 use super::audio_processing::{audio_to_mono, LoudnessNormalizer, NoiseSuppressionProcessor, HighPassFilter};
 use super::vad::{ContinuousVadProcessor};
+use super::speaker_tracker::{SourceAudio, SOURCE_SAMPLE_RATE};
 
 /// How long a silence must last before the VAD closes a speech segment, and
 /// therefore how long the audio clips handed to the ASR engine are.
@@ -153,6 +154,63 @@ impl AudioMixerRingBuffer {
         Some((mic_window, sys_window))
     }
 
+}
+
+/// Keeps recent mic and system audio separately (16kHz) on the same clock as the
+/// VAD, so each speech segment can be attributed to its source before mixing hides it.
+struct SourceTimeline {
+    mic: VecDeque<f32>,
+    system: VecDeque<f32>,
+    /// Absolute 16kHz sample index of the first buffered sample.
+    start_sample: usize,
+    /// Input samples per 16kHz sample; 0 disables tracking for unsupported rates.
+    decimation: usize,
+}
+
+impl SourceTimeline {
+    /// Long enough for a VAD segment held open by continuous speech (#756).
+    const MAX_SAMPLES: usize = SOURCE_SAMPLE_RATE as usize * 120;
+
+    fn new(sample_rate: u32) -> Self {
+        let decimation = if sample_rate % SOURCE_SAMPLE_RATE == 0 {
+            (sample_rate / SOURCE_SAMPLE_RATE) as usize
+        } else {
+            warn!("Speaker labels disabled: {}Hz is not a multiple of {}Hz", sample_rate, SOURCE_SAMPLE_RATE);
+            0
+        };
+        Self { mic: VecDeque::new(), system: VecDeque::new(), start_sample: 0, decimation }
+    }
+
+    fn push(&mut self, mic_window: &[f32], sys_window: &[f32]) {
+        if self.decimation == 0 {
+            return;
+        }
+        self.mic.extend(mic_window.chunks(self.decimation).map(average));
+        self.system.extend(sys_window.chunks(self.decimation).map(average));
+        let excess = self.mic.len().saturating_sub(Self::MAX_SAMPLES);
+        if excess > 0 {
+            self.mic.drain(..excess);
+            self.system.drain(..excess);
+            self.start_sample += excess;
+        }
+    }
+
+    fn slice(&self, start_ms: f64, end_ms: f64) -> Option<SourceAudio> {
+        let to_index = |ms: f64| (ms * SOURCE_SAMPLE_RATE as f64 / 1000.0) as usize;
+        let start = to_index(start_ms).saturating_sub(self.start_sample);
+        let end = to_index(end_ms).saturating_sub(self.start_sample).min(self.mic.len());
+        if self.decimation == 0 || start >= end {
+            return None;
+        }
+        Some(SourceAudio {
+            mic: self.mic.range(start..end).copied().collect(),
+            system: self.system.range(start..end).copied().collect(),
+        })
+    }
+}
+
+fn average(samples: &[f32]) -> f32 {
+    samples.iter().sum::<f32>() / samples.len() as f32
 }
 
 /// Simple audio mixer without aggressive ducking
@@ -626,6 +684,7 @@ impl AudioCapture {
             timestamp,
             chunk_id,
             device_type: self.device_type.clone(),
+            source_audio: None,
         };
 
         // NOTE: Raw audio is NOT sent to recording saver to prevent echo
@@ -705,6 +764,7 @@ pub struct AudioPipeline {
     // PROFESSIONAL AUDIO MIXING: Ring buffer + RMS-based mixer
     ring_buffer: AudioMixerRingBuffer,
     mixer: ProfessionalAudioMixer,
+    source_timeline: SourceTimeline,
     // Recording sender for pre-mixed audio
     recording_sender_for_mixed: Option<mpsc::UnboundedSender<AudioChunk>>,
 }
@@ -765,6 +825,7 @@ impl AudioPipeline {
         // Initialize professional audio mixing components
         let ring_buffer = AudioMixerRingBuffer::new(sample_rate);
         let mixer = ProfessionalAudioMixer::new(sample_rate);
+        let source_timeline = SourceTimeline::new(sample_rate);
 
         // Note: target_chunk_duration_ms is ignored - VAD controls segmentation now
         let _ = target_chunk_duration_ms;
@@ -784,6 +845,7 @@ impl AudioPipeline {
             // Initialize professional audio mixing
             ring_buffer,
             mixer,
+            source_timeline,
             recording_sender_for_mixed: None,  // Will be set by manager
         })
     }
@@ -849,6 +911,7 @@ impl AudioPipeline {
                         if let Some((mic_window, sys_window)) = self.ring_buffer.extract_window() {
                             // Simple mixing without aggressive ducking
                             let mixed_clean = self.mixer.mix_window(&mic_window, &sys_window);
+                            self.source_timeline.push(&mic_window, &sys_window);
 
                             // NO POST-GAIN NEEDED: Microphone already normalized by EBU R128 to -23 LUFS
                             // This is broadcast-standard loudness (Netflix/YouTube/Spotify level)
@@ -867,6 +930,7 @@ impl AudioPipeline {
                                                   duration_ms, segment.samples.len());
 
                                             let transcription_chunk = AudioChunk {
+                                                source_audio: self.source_timeline.slice(segment.start_timestamp_ms, segment.end_timestamp_ms),
                                                 data: segment.samples,
                                                 sample_rate: 16000,
                                                 timestamp: segment.start_timestamp_ms / 1000.0,
@@ -898,6 +962,7 @@ impl AudioPipeline {
                                     timestamp: chunk.timestamp,
                                     chunk_id: self.chunk_id_counter,
                                     device_type: DeviceType::Microphone,  // Mixed audio
+                                    source_audio: None,
                                 };
                                 let _ = sender.send(recording_chunk);
                             }
@@ -937,6 +1002,7 @@ impl AudioPipeline {
                               duration_ms, segment.samples.len());
 
                         let transcription_chunk = AudioChunk {
+                            source_audio: self.source_timeline.slice(segment.start_timestamp_ms, segment.end_timestamp_ms),
                             data: segment.samples,
                             sample_rate: 16000,
                             timestamp: segment.start_timestamp_ms / 1000.0,
@@ -1063,6 +1129,7 @@ impl AudioPipelineManager {
                 timestamp: 0.0,
                 chunk_id: u64::MAX, // Special ID to indicate flush
                 device_type: super::recording_state::DeviceType::Microphone,
+                source_audio: None,
             };
 
             if let Err(e) = sender.send(flush_chunk) {
@@ -1083,6 +1150,7 @@ impl AudioPipelineManager {
                         timestamp: 0.0,
                         chunk_id: u64::MAX - (i as u64),
                         device_type: super::recording_state::DeviceType::Microphone,
+                        source_audio: None,
                     };
                     let _ = sender.send(additional_flush);
                 }

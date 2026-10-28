@@ -32,6 +32,8 @@ fn detect_and_report_gpu_capabilities() {
 
     match target_os.as_str() {
         "macos" => {
+            // sherpa-onnx dylibs (speaker labels) are bundled into Contents/Frameworks
+            println!("cargo:rustc-link-arg=-Wl,-rpath,@executable_path/../Frameworks");
             println!("cargo:warning=✅ macOS: Metal GPU acceleration ENABLED by default");
             #[cfg(feature = "coreml")]
             println!("cargo:warning=✅ CoreML acceleration ENABLED");

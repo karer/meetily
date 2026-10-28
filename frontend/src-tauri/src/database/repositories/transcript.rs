@@ -47,8 +47,8 @@ impl TranscriptsRepository {
         for segment in transcripts {
             let transcript_id = format!("transcript-{}", Uuid::new_v4());
             let result = sqlx::query(
-                "INSERT INTO transcripts (id, meeting_id, transcript, timestamp, audio_start_time, audio_end_time, duration)
-                 VALUES (?, ?, ?, ?, ?, ?, ?)"
+                "INSERT INTO transcripts (id, meeting_id, transcript, timestamp, audio_start_time, audio_end_time, duration, speaker)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
             )
             .bind(&transcript_id)
             .bind(&meeting_id)
@@ -57,6 +57,7 @@ impl TranscriptsRepository {
             .bind(segment.audio_start_time)
             .bind(segment.audio_end_time)
             .bind(segment.duration)
+            .bind(&segment.speaker)
             .execute(&mut *transaction)
             .await;
 
@@ -80,6 +81,23 @@ impl TranscriptsRepository {
         transaction.commit().await?;
 
         Ok(meeting_id)
+    }
+
+    /// Renames a speaker in one meeting. Renaming onto an existing name merges
+    /// the two, which also fixes one person split into two speakers.
+    pub async fn rename_speaker(
+        pool: &SqlitePool,
+        meeting_id: &str,
+        from: &str,
+        to: &str,
+    ) -> Result<u64, SqlxError> {
+        let result = sqlx::query("UPDATE transcripts SET speaker = ? WHERE meeting_id = ? AND speaker = ?")
+            .bind(to)
+            .bind(meeting_id)
+            .bind(from)
+            .execute(pool)
+            .await?;
+        Ok(result.rows_affected())
     }
 
     /// Searches for a query string within the transcripts.

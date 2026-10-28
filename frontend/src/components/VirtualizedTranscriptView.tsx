@@ -9,6 +9,7 @@ import { Tooltip, TooltipContent, TooltipTrigger } from "./ui/tooltip";
 import { RecordingStatusBar } from "./RecordingStatusBar";
 import { motion, AnimatePresence } from "framer-motion";
 import { TranscriptSegmentData } from "@/types";
+import { speakerColor } from "@/lib/speakers";
 
 export interface VirtualizedTranscriptViewProps {
     /** Transcript segments to display */
@@ -34,6 +35,9 @@ export interface VirtualizedTranscriptViewProps {
     totalCount?: number;
     loadedCount?: number;
     onLoadMore?: () => void;
+
+    /** Renames a speaker across the meeting; badges are read-only without it */
+    onRenameSpeaker?: (from: string, to: string) => void;
 }
 
 // Threshold for enabling virtualization (below this, use simple rendering)
@@ -63,6 +67,46 @@ function cleanStopWords(text: string): string {
     return cleanedText.replace(/\s+/g, ' ').trim();
 }
 
+// Speaker badge; click to rename when renaming is available
+function SpeakerBadge({
+    speaker,
+    onRename,
+}: {
+    speaker: string;
+    onRename?: (from: string, to: string) => void;
+}) {
+    const [draft, setDraft] = useState<string | null>(null);
+    const className = `text-xs font-semibold rounded px-1.5 py-0.5 ${speakerColor(speaker)}`;
+
+    if (draft !== null) {
+        const commit = () => {
+            const name = draft.trim();
+            setDraft(null);
+            if (name && name !== speaker) onRename?.(speaker, name);
+        };
+        return (
+            <input
+                autoFocus
+                value={draft}
+                onChange={(e) => setDraft(e.target.value)}
+                onBlur={commit}
+                onKeyDown={(e) => {
+                    if (e.key === 'Enter') commit();
+                    if (e.key === 'Escape') setDraft(null);
+                }}
+                className="text-xs font-semibold rounded px-1.5 py-0.5 border border-gray-300 outline-none"
+            />
+        );
+    }
+
+    if (!onRename) return <span className={className}>{speaker}</span>;
+    return (
+        <button type="button" title="Rename speaker" onClick={() => setDraft(speaker)} className={`${className} hover:opacity-80`}>
+            {speaker}
+        </button>
+    );
+}
+
 // Memoized transcript segment component
 const TranscriptSegment = memo(function TranscriptSegment({
     id,
@@ -71,6 +115,8 @@ const TranscriptSegment = memo(function TranscriptSegment({
     confidence,
     isStreaming,
     showConfidence,
+    speaker,
+    onRenameSpeaker,
 }: {
     id: string;
     timestamp: number;
@@ -78,11 +124,19 @@ const TranscriptSegment = memo(function TranscriptSegment({
     confidence?: number;
     isStreaming: boolean;
     showConfidence: boolean;
+    /** Set only when the speaker changes from the previous segment */
+    speaker?: string | null;
+    onRenameSpeaker?: (from: string, to: string) => void;
 }) {
     const displayText = cleanStopWords(text) || (text.trim() === '' ? '[Silence]' : text);
 
     return (
         <div id={`segment-${id}`} className="mb-3">
+            {speaker && (
+                <div className="mb-1 ml-[58px]">
+                    <SpeakerBadge speaker={speaker} onRename={onRenameSpeaker} />
+                </div>
+            )}
             <div className="flex items-start gap-2">
                 <Tooltip>
                     <TooltipTrigger>
@@ -124,6 +178,7 @@ export const VirtualizedTranscriptView: React.FC<VirtualizedTranscriptViewProps>
     totalCount = 0,
     loadedCount = 0,
     onLoadMore,
+    onRenameSpeaker,
 }) => {
     // Create scroll ref first - shared between virtualizer and auto-scroll hook
     const scrollRef = useRef<HTMLDivElement>(null);
@@ -145,6 +200,12 @@ export const VirtualizedTranscriptView: React.FC<VirtualizedTranscriptViewProps>
             });
         },
     });
+
+    // Speaker label is shown only where the speaker changes
+    const speakerChange = (index: number) => {
+        const speaker = segments[index]?.speaker;
+        return speaker && speaker !== segments[index - 1]?.speaker ? speaker : null;
+    };
 
     // Custom hook for auto-scrolling (supports both virtualized and non-virtualized)
     useAutoScroll({
@@ -296,6 +357,8 @@ export const VirtualizedTranscriptView: React.FC<VirtualizedTranscriptViewProps>
                                         confidence={segment.confidence}
                                         isStreaming={isStreaming}
                                         showConfidence={showConfidence}
+                                        speaker={speakerChange(virtualRow.index)}
+                                        onRenameSpeaker={onRenameSpeaker}
                                     />
                                 </div>
                             );
@@ -335,7 +398,7 @@ export const VirtualizedTranscriptView: React.FC<VirtualizedTranscriptViewProps>
                 // Simple rendering for small lists (better animations)
                 <>
                     <div className="space-y-1">
-                        {segments.map((segment) => {
+                        {segments.map((segment, index) => {
                             const isStreaming = streamingSegmentId === segment.id;
 
                             return (
@@ -352,6 +415,8 @@ export const VirtualizedTranscriptView: React.FC<VirtualizedTranscriptViewProps>
                                         confidence={segment.confidence}
                                         isStreaming={isStreaming}
                                         showConfidence={showConfidence}
+                                        speaker={speakerChange(index)}
+                                        onRenameSpeaker={onRenameSpeaker}
                                     />
                                 </motion.div>
                             );

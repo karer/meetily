@@ -18,7 +18,7 @@ use tauri_plugin_dialog::DialogExt;
 use uuid::Uuid;
 
 use super::audio_processing::create_meeting_folder;
-use super::common::{create_transcript_segments, split_segment_at_silence, write_transcripts_json};
+use super::common::{batch_speaker_tracker, create_transcript_segments, split_segment_at_silence, write_transcripts_json};
 use super::constants::AUDIO_EXTENSIONS;
 use super::recording_preferences::get_default_recordings_folder;
 
@@ -546,7 +546,8 @@ async fn run_import<R: Runtime>(
     info!("Processing {} segments (after splitting)", processable_count);
 
     // Process each speech segment
-    let mut all_transcripts: Vec<(String, f64, f64)> = Vec::new();
+    let mut speaker_tracker = batch_speaker_tracker(&app).await;
+    let mut all_transcripts: Vec<(String, f64, f64, Option<String>)> = Vec::new();
     let mut total_confidence = 0.0f32;
 
     for (i, segment) in processable_segments.iter().enumerate() {
@@ -603,7 +604,7 @@ async fn run_import<R: Runtime>(
                 i + 1, processable_count, segment_duration_sec, conf,
                 if trimmed.len() > 80 { let mut end = 80; while !trimmed.is_char_boundary(end) { end -= 1; } &trimmed[..end] } else { trimmed }
             );
-            all_transcripts.push((text, segment.start_timestamp_ms, segment.end_timestamp_ms));
+            all_transcripts.push((text, segment.start_timestamp_ms, segment.end_timestamp_ms, Some(speaker_tracker.label_voice(&segment.samples))));
             total_confidence += conf;
         } else {
             debug!("Segment {}/{}: {:.1}s — empty transcription", i + 1, processable_count, segment_duration_sec);
@@ -720,8 +721,8 @@ async fn create_meeting_with_transcripts(
     // Insert transcripts
     for segment in segments {
         sqlx::query(
-            "INSERT INTO transcripts (id, meeting_id, transcript, timestamp, audio_start_time, audio_end_time, duration)
-             VALUES (?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO transcripts (id, meeting_id, transcript, timestamp, audio_start_time, audio_end_time, duration, speaker)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&segment.id)
         .bind(&meeting_id)
@@ -730,6 +731,7 @@ async fn create_meeting_with_transcripts(
         .bind(segment.audio_start_time)
         .bind(segment.audio_end_time)
         .bind(segment.duration)
+        .bind(&segment.speaker)
         .execute(&mut *tx)
         .await
         .map_err(|e| anyhow!("Failed to insert transcript: {}", e))?;
@@ -1019,14 +1021,14 @@ mod tests {
 
     #[test]
     fn test_create_transcript_segments_empty() {
-        let transcripts: Vec<(String, f64, f64)> = vec![];
+        let transcripts: Vec<(String, f64, f64, Option<String>)> = vec![];
         let segments = create_transcript_segments(&transcripts);
         assert!(segments.is_empty());
     }
 
     #[test]
     fn test_create_transcript_segments_single() {
-        let transcripts = vec![("Hello world".to_string(), 0.0, 1500.0)];
+        let transcripts = vec![("Hello world".to_string(), 0.0, 1500.0, None)];
         let segments = create_transcript_segments(&transcripts);
 
         assert_eq!(segments.len(), 1);
@@ -1182,6 +1184,7 @@ mod tests {
                 audio_start_time: Some(0.0),
                 audio_end_time: Some(1.5),
                 duration: Some(1.5),
+                speaker: None,
             },
             TranscriptSegment {
                 id: "t-2".to_string(),
@@ -1190,6 +1193,7 @@ mod tests {
                 audio_start_time: Some(2.0),
                 audio_end_time: Some(3.5),
                 duration: Some(1.5),
+                speaker: None,
             },
         ];
 

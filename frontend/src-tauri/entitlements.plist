@@ -10,5 +10,8 @@
     <true/>
     <key>com.apple.security.device.screen-capture</key>
     <true/>
+    <!-- Bundled sherpa-onnx/onnxruntime dylibs (speaker labels) are signed by another team -->
+    <key>com.apple.security.cs.disable-library-validation</key>
+    <true/>
 </dict>
 </plist>

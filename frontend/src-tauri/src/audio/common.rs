@@ -5,7 +5,10 @@ use once_cell::sync::Lazy;
 use std::path::Path;
 use std::sync::Arc;
 use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
+use tauri::{AppHandle, Manager, Runtime};
 use uuid::Uuid;
+
+use super::speaker_tracker::{self, SpeakerTracker};
 
 static ENGINE_LIFECYCLE_LOCK: Lazy<Arc<AsyncMutex<()>>> =
     Lazy::new(|| Arc::new(AsyncMutex::new(())));
@@ -46,12 +49,25 @@ pub(crate) async fn unload_engine_after_batch(use_parakeet: bool) {
     }
 }
 
+/// Speaker tracker for a batch job; waits for the embedding model, which a
+/// batch can afford. Without it every segment is labelled "others".
+pub(crate) async fn batch_speaker_tracker<R: Runtime>(app: &AppHandle<R>) -> SpeakerTracker {
+    let Ok(dir) = app.path().app_data_dir() else {
+        return SpeakerTracker::new(Default::default());
+    };
+    let path = speaker_tracker::model_path(&dir);
+    if let Err(e) = speaker_tracker::ensure_model(&path).await {
+        log::warn!("Speaker embedding model unavailable: {}", e);
+    }
+    SpeakerTracker::new(path)
+}
+
 /// Create transcript segments from transcription results.
-/// Each tuple is (text, start_ms, end_ms) from VAD timestamps.
-pub(crate) fn create_transcript_segments(transcripts: &[(String, f64, f64)]) -> Vec<TranscriptSegment> {
+/// Each tuple is (text, start_ms, end_ms, speaker) from VAD timestamps.
+pub(crate) fn create_transcript_segments(transcripts: &[(String, f64, f64, Option<String>)]) -> Vec<TranscriptSegment> {
     transcripts
         .iter()
-        .map(|(text, start_ms, end_ms)| {
+        .map(|(text, start_ms, end_ms, speaker)| {
             let start_seconds = start_ms / 1000.0;
             let end_seconds = end_ms / 1000.0;
             let duration = end_seconds - start_seconds;
@@ -63,6 +79,7 @@ pub(crate) fn create_transcript_segments(transcripts: &[(String, f64, f64)]) -> 
                 audio_start_time: Some(start_seconds),
                 audio_end_time: Some(end_seconds),
                 duration: Some(duration),
+                speaker: speaker.clone(),
             }
         })
         .collect()
@@ -85,6 +102,7 @@ pub(crate) fn write_transcripts_json(folder: &Path, segments: &[TranscriptSegmen
                 "audio_start_time": s.audio_start_time,
                 "audio_end_time": s.audio_end_time,
                 "duration": s.duration,
+                "speaker": s.speaker,
                 "sequence_id": i
             })
         }).collect::<Vec<_>>()

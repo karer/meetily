@@ -137,6 +137,8 @@ pub struct MeetingTranscript {
     pub audio_end_time: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub duration: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub speaker: Option<String>,
 }
 
 /// Meeting metadata without transcripts (for pagination)
@@ -188,6 +190,8 @@ pub struct TranscriptSegment {
     pub audio_end_time: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub duration: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub speaker: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -878,6 +882,7 @@ pub async fn api_get_meeting_transcripts<R: Runtime>(
                     audio_start_time: t.audio_start_time,
                     audio_end_time: t.audio_end_time,
                     duration: t.duration,
+                    speaker: t.speaker,
                 })
                 .collect::<Vec<_>>();
 
@@ -894,6 +899,22 @@ pub async fn api_get_meeting_transcripts<R: Runtime>(
             Err(format!("Failed to retrieve transcripts: {}", e))
         }
     }
+}
+
+#[tauri::command]
+pub async fn api_rename_speaker(
+    state: tauri::State<'_, AppState>,
+    meeting_id: String,
+    from: String,
+    to: String,
+) -> Result<u64, String> {
+    let to = to.trim();
+    if to.is_empty() {
+        return Err("Speaker name cannot be empty".to_string());
+    }
+    TranscriptsRepository::rename_speaker(state.db_manager.pool(), &meeting_id, &from, to)
+        .await
+        .map_err(|e| format!("Failed to rename speaker: {}", e))
 }
 
 #[tauri::command]

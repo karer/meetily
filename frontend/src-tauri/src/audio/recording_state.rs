@@ -22,6 +22,8 @@ pub struct AudioChunk {
     pub timestamp: f64,
     pub chunk_id: u64,
     pub device_type: DeviceType,
+    /// Unmixed mic and system audio of a VAD segment, for speaker labels.
+    pub source_audio: Option<super::speaker_tracker::SourceAudio>,
 }
 
 /// Processed audio chunk (post-VAD) for recording

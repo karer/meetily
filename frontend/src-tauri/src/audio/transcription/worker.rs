@@ -4,12 +4,13 @@
 
 use super::engine::TranscriptionEngine;
 use super::provider::TranscriptionError;
+use crate::audio::speaker_tracker::{self, SpeakerTracker};
 use crate::audio::AudioChunk;
 use log::{error, info, warn};
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
-use tauri::{AppHandle, Emitter, Runtime};
+use tauri::{AppHandle, Emitter, Manager, Runtime};
 
 // Sequence counter for transcript updates
 static SEQUENCE_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -42,6 +43,8 @@ pub struct TranscriptUpdate {
     pub audio_start_time: f64, // Seconds from recording start (e.g., 125.3)
     pub audio_end_time: f64,   // Seconds from recording start (e.g., 128.6)
     pub duration: f64,          // Segment duration in seconds (e.g., 3.3)
+    /// "Me", "Others" or "Speaker N"; None when sources are unknown
+    pub speaker: Option<String>,
 }
 
 // NOTE: get_transcript_history and get_recording_meeting_name functions
@@ -70,6 +73,22 @@ pub fn start_transcription_task<R: Runtime>(
             }
         };
 
+        // Speaker labels: fetch the embedding model in the background on first use
+        let speaker_model_path = match app.path().app_data_dir() {
+            Ok(dir) => Some(speaker_tracker::model_path(&dir)),
+            Err(e) => {
+                warn!("Speaker labels limited to me/others: no app data dir ({})", e);
+                None
+            }
+        };
+        if let Some(path) = speaker_model_path.clone() {
+            tokio::spawn(async move {
+                if let Err(e) = speaker_tracker::ensure_model(&path).await {
+                    warn!("Speaker embedding model download failed: {}", e);
+                }
+            });
+        }
+
         // Create parallel workers for faster processing while preserving ALL chunks
         const NUM_WORKERS: usize = 1; // Serial processing ensures transcripts emit in chronological order
         let (work_sender, work_receiver) = tokio::sync::mpsc::unbounded_channel::<AudioChunk>();
@@ -95,6 +114,8 @@ pub fn start_transcription_task<R: Runtime>(
             let chunks_completed_clone = chunks_completed.clone();
             let input_finished_clone = input_finished.clone();
             let chunks_queued_clone = chunks_queued.clone();
+            // Serial worker, so one tracker sees every segment of the recording in order
+            let mut speaker_tracker = SpeakerTracker::new(speaker_model_path.clone().unwrap_or_default());
 
             let worker_handle = tokio::spawn(async move {
                 info!("👷 Worker {} started", worker_id);
@@ -125,7 +146,7 @@ pub fn start_transcription_task<R: Runtime>(
                     };
 
                     match chunk {
-                        Some(chunk) => {
+                        Some(mut chunk) => {
                             // PERFORMANCE OPTIMIZATION: Reduce logging in hot path
                             // Only log every 10th chunk per worker to reduce I/O overhead
                             let should_log_this_chunk = chunk.chunk_id % 10 == 0;
@@ -149,6 +170,7 @@ pub fn start_transcription_task<R: Runtime>(
 
                             let chunk_timestamp = chunk.timestamp;
                             let chunk_duration = chunk.data.len() as f64 / chunk.sample_rate as f64;
+                            let source_audio = chunk.source_audio.take();
 
                             // Transcribe with provider-agnostic approach
                             match transcribe_chunk_with_provider(
@@ -215,6 +237,7 @@ pub fn start_transcription_task<R: Runtime>(
                                             audio_start_time,
                                             audio_end_time,
                                             duration: chunk_duration,
+                                            speaker: source_audio.as_ref().map(|audio| speaker_tracker.label(audio)),
                                         };
 
                                         if let Err(e) = app_clone.emit("transcript-update", &update)
