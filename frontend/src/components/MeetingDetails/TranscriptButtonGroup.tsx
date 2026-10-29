@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useCallback } from 'react';
+import { useState, useCallback, useEffect } from 'react';
 import { Button } from '@/components/ui/button';
 import { ButtonGroup } from '@/components/ui/button-group';
 import { Copy, FolderOpen, RefreshCw } from 'lucide-react';
@@ -16,6 +16,9 @@ interface TranscriptButtonGroupProps {
   meetingId?: string;
   meetingFolderPath?: string | null;
   onRefetchTranscripts?: () => Promise<void>;
+  /** Open the retranscribe dialog and start right away (after a recording) */
+  autoRetranscribe?: boolean;
+  onAutoRetranscribeDone?: () => void;
 }
 
 
@@ -26,9 +29,28 @@ export function TranscriptButtonGroup({
   meetingId,
   meetingFolderPath,
   onRefetchTranscripts,
+  autoRetranscribe = false,
+  onAutoRetranscribeDone,
 }: TranscriptButtonGroupProps) {
   const { betaFeatures } = useConfig();
   const [showRetranscribeDialog, setShowRetranscribeDialog] = useState(false);
+  const [autoRun, setAutoRun] = useState(false);
+
+  useEffect(() => {
+    if (autoRetranscribe) {
+      setAutoRun(true);
+      setShowRetranscribeDialog(true);
+    }
+  }, [autoRetranscribe]);
+
+  // Closing the dialog ends an automatic run however it went (done, failed, cancelled)
+  const handleRetranscribeOpenChange = useCallback((open: boolean) => {
+    setShowRetranscribeDialog(open);
+    if (!open && autoRun) {
+      setAutoRun(false);
+      onAutoRetranscribeDone?.();
+    }
+  }, [autoRun, onAutoRetranscribeDone]);
 
   const handleRetranscribeComplete = useCallback(async () => {
     // Refetch transcripts to show the updated data
@@ -89,7 +111,8 @@ export function TranscriptButtonGroup({
       {betaFeatures.importAndRetranscribe && meetingId && meetingFolderPath && (
         <RetranscribeDialog
           open={showRetranscribeDialog}
-          onOpenChange={setShowRetranscribeDialog}
+          onOpenChange={handleRetranscribeOpenChange}
+          autoStart={autoRun}
           meetingId={meetingId}
           meetingFolderPath={meetingFolderPath}
           onComplete={handleRetranscribeComplete}

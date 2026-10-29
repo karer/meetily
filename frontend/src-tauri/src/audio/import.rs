@@ -18,7 +18,7 @@ use tauri_plugin_dialog::DialogExt;
 use uuid::Uuid;
 
 use super::audio_processing::create_meeting_folder;
-use super::common::{batch_speaker_tracker, create_transcript_segments, split_segment_at_silence, write_transcripts_json};
+use super::common::{batch_speaker_pieces, create_transcript_segments, write_transcripts_json};
 use super::constants::AUDIO_EXTENSIONS;
 use super::recording_preferences::get_default_recordings_folder;
 
@@ -259,6 +259,7 @@ pub async fn start_import<R: Runtime>(
     language: Option<String>,
     model: Option<String>,
     provider: Option<String>,
+    num_speakers: Option<usize>,
 ) -> Result<ImportResult> {
     // Acquire guard - ensures flag is cleared even on panic/early return
     let _guard = ImportGuard::acquire().map_err(|e| anyhow!(e))?;
@@ -274,6 +275,7 @@ pub async fn start_import<R: Runtime>(
         language,
         model,
         provider,
+        num_speakers,
     )
     .await;
 
@@ -316,6 +318,7 @@ async fn run_import<R: Runtime>(
     language: Option<String>,
     model: Option<String>,
     provider: Option<String>,
+    num_speakers: Option<usize>,
 ) -> Result<ImportResult> {
     let source = PathBuf::from(&source_path);
 
@@ -520,37 +523,30 @@ async fn run_import<R: Runtime>(
         None
     };
 
-    // Split very long segments at silence boundaries for better transcription quality.
-    // Hard cuts at arbitrary sample positions lose words at boundaries. Instead, scan
-    // for the lowest-energy window near the target split point and cut there.
-    const MAX_SEGMENT_SAMPLES: usize = 25 * 16000; // 25 seconds at 16kHz
-
-    let mut processable_segments: Vec<crate::audio::vad::SpeechSegment> = Vec::new();
-    for segment in &speech_segments {
-        if segment.samples.len() > MAX_SEGMENT_SAMPLES {
-            debug!(
-                "Splitting large segment ({:.0}ms, {} samples) at silence boundaries",
-                segment.end_timestamp_ms - segment.start_timestamp_ms,
-                segment.samples.len()
-            );
-
-            let sub_segments = split_segment_at_silence(segment, MAX_SEGMENT_SAMPLES);
-            debug!("Split into {} sub-segments", sub_segments.len());
-            processable_segments.extend(sub_segments);
-        } else {
-            processable_segments.push(segment.clone());
+    emit_progress(&app, "diarizing", 30, "Identifying speakers...");
+    let app_for_diarization = app.clone();
+    let processable_segments = batch_speaker_pieces(&app, speech_segments, num_speakers, move |done, total| {
+        let percent = done * 100 / total.max(1);
+        emit_progress(&app_for_diarization, "diarizing", 30, &format!("Identifying speakers... {}%", percent));
+        !IMPORT_CANCELLED.load(Ordering::SeqCst)
+    })
+    .await;
+    let processable_segments = match processable_segments {
+        Ok(pieces) => pieces,
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(&meeting_folder);
+            return Err(e);
         }
-    }
+    };
 
     let processable_count = processable_segments.len();
-    info!("Processing {} segments (after splitting)", processable_count);
+    info!("Processing {} segments (after diarization and splitting)", processable_count);
 
     // Process each speech segment
-    let mut speaker_tracker = batch_speaker_tracker(&app).await;
     let mut all_transcripts: Vec<(String, f64, f64, Option<String>)> = Vec::new();
     let mut total_confidence = 0.0f32;
 
-    for (i, segment) in processable_segments.iter().enumerate() {
+    for (i, (segment, speaker)) in processable_segments.iter().enumerate() {
         if IMPORT_CANCELLED.load(Ordering::SeqCst) {
             let _ = std::fs::remove_dir_all(&meeting_folder);
             return Err(anyhow!("Import cancelled"));
@@ -604,7 +600,7 @@ async fn run_import<R: Runtime>(
                 i + 1, processable_count, segment_duration_sec, conf,
                 if trimmed.len() > 80 { let mut end = 80; while !trimmed.is_char_boundary(end) { end -= 1; } &trimmed[..end] } else { trimmed }
             );
-            all_transcripts.push((text, segment.start_timestamp_ms, segment.end_timestamp_ms, Some(speaker_tracker.label_voice(&segment.samples))));
+            all_transcripts.push((text, segment.start_timestamp_ms, segment.end_timestamp_ms, speaker.clone()));
             total_confidence += conf;
         } else {
             debug!("Segment {}/{}: {:.1}s — empty transcription", i + 1, processable_count, segment_duration_sec);
@@ -971,6 +967,7 @@ pub async fn start_import_audio_command<R: Runtime>(
     language: Option<String>,
     model: Option<String>,
     provider: Option<String>,
+    num_speakers: Option<usize>,
 ) -> Result<ImportStarted, String> {
     // Check if import is already in progress (guard will be acquired in start_import)
     if IMPORT_IN_PROGRESS.load(Ordering::SeqCst) {
@@ -979,7 +976,8 @@ pub async fn start_import_audio_command<R: Runtime>(
 
     // Spawn import in background
     tauri::async_runtime::spawn(async move {
-        let result = start_import(app, source_path, title, language, model, provider).await;
+        let num_speakers = num_speakers.filter(|&n| (1..=super::diarization::MAX_SPEAKERS).contains(&n));
+        let result = start_import(app, source_path, title, language, model, provider, num_speakers).await;
 
         if let Err(e) = result {
             error!("Import failed: {}", e);
@@ -1010,6 +1008,7 @@ pub async fn is_import_in_progress_command() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::audio::common::split_segment_at_silence;
 
     #[test]
     fn test_audio_extensions() {

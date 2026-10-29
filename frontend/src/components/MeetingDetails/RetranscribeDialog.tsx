@@ -23,6 +23,7 @@ import { useConfig } from '@/contexts/ConfigContext';
 import { LANGUAGES } from '@/constants/languages';
 import { useTranscriptionModels, ModelOption } from '@/hooks/useTranscriptionModels';
 import Analytics from '@/lib/analytics';
+import { SpeakerCountSelect, toNumSpeakers } from '../SpeakerCountSelect';
 
 interface RetranscribeDialogProps {
   open: boolean;
@@ -30,6 +31,8 @@ interface RetranscribeDialogProps {
   meetingId: string;
   meetingFolderPath: string | null;
   onComplete?: () => void;
+  /** Start as soon as the default model is selected, without waiting for a click */
+  autoStart?: boolean;
 }
 
 interface RetranscriptionProgress {
@@ -57,12 +60,14 @@ export function RetranscribeDialog({
   meetingId,
   meetingFolderPath,
   onComplete,
+  autoStart = false,
 }: RetranscribeDialogProps) {
   const { selectedLanguage, transcriptModelConfig } = useConfig();
   const [isProcessing, setIsProcessing] = useState(false);
   const [progress, setProgress] = useState<RetranscriptionProgress | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [selectedLang, setSelectedLang] = useState(selectedLanguage || 'auto');
+  const [selectedSpeakers, setSelectedSpeakers] = useState('auto');
 
   // Use centralized model fetching hook
   const {
@@ -82,6 +87,7 @@ export function RetranscribeDialog({
 
   // Track previous open state to only reset on closed→open transition
   const prevOpenRef = useRef(false);
+  const autoStartedRef = useRef(false);
 
   // Helper to get selected model details (memoized)
   const selectedModelDetails = useMemo((): ModelOption | undefined => {
@@ -112,6 +118,8 @@ export function RetranscribeDialog({
       setProgress(null);
       setError(null);
       setSelectedLang(selectedLanguage || 'auto');
+      setSelectedSpeakers('auto');
+      autoStartedRef.current = false;
 
       // Fetch available models using centralized hook
       fetchModels();
@@ -220,6 +228,7 @@ export function RetranscribeDialog({
         language: languageToSend,
         model: selectedModelDetails?.name || null,
         provider: selectedModelDetails?.provider || null,
+        numSpeakers: toNumSpeakers(selectedSpeakers),
       });
     } catch (err: any) {
       setIsProcessing(false);
@@ -229,6 +238,15 @@ export function RetranscribeDialog({
       await Analytics.trackError('enhance_transcript_failed', errorMsg);
     }
   };
+
+  useEffect(() => {
+    if (open && autoStart && !autoStartedRef.current && !loadingModels && selectedModelDetails) {
+      autoStartedRef.current = true;
+      handleStartRetranscription();
+    }
+    // handleStartRetranscription is recreated every render; the ref guards a single start
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open, autoStart, loadingModels, selectedModelDetails]);
 
   const handleCancel = async () => {
     if (isProcessing) {
@@ -295,7 +313,7 @@ export function RetranscribeDialog({
               ? progress?.message || 'Processing audio...'
               : error
                 ? 'An error occurred during retranscription'
-                : 'Re-process the audio with different language settings'}
+                : 'Re-process the audio and identify speakers'}
           </DialogDescription>
         </DialogHeader>
 
@@ -358,6 +376,10 @@ export function RetranscribeDialog({
                 Choose a transcription model
               </p>
             </div>
+          )}
+
+          {!isProcessing && !error && (
+            <SpeakerCountSelect value={selectedSpeakers} onChange={setSelectedSpeakers} />
           )}
 
           {isProcessing && progress && (

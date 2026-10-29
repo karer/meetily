@@ -2,7 +2,7 @@
 
 use crate::audio::decoder::decode_audio_file;
 use crate::audio::vad::get_speech_chunks_with_progress;
-use super::common::{batch_speaker_tracker, create_transcript_segments, split_segment_at_silence, write_transcripts_json};
+use super::common::{batch_speaker_pieces, carry_over_me, create_transcript_segments, write_transcripts_json};
 use super::constants::AUDIO_EXTENSIONS;
 use crate::config::{DEFAULT_WHISPER_MODEL, DEFAULT_PARAKEET_MODEL};
 use crate::parakeet_engine::ParakeetEngine;
@@ -50,7 +50,7 @@ impl Drop for RetranscriptionGuard {
 /// (500ms) because the entire file is processed at once by VAD with no
 /// latency requirement, and short redemption fragments speech at every
 /// natural sentence/topic pause (500ms-2s)
-const VAD_REDEMPTION_TIME_MS: u32 = 2000;
+pub(crate) const VAD_REDEMPTION_TIME_MS: u32 = 2000;
 
 /// Progress update emitted during retranscription
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -95,6 +95,7 @@ pub async fn start_retranscription<R: Runtime>(
     language: Option<String>,
     model: Option<String>,
     provider: Option<String>,
+    num_speakers: Option<usize>,
 ) -> Result<RetranscriptionResult> {
     // Acquire guard - ensures flag is cleared even on panic/early return
     let _guard = RetranscriptionGuard::acquire().map_err(|e| anyhow!(e))?;
@@ -103,7 +104,7 @@ pub async fn start_retranscription<R: Runtime>(
     RETRANSCRIPTION_CANCELLED.store(false, Ordering::SeqCst);
 
     let use_parakeet = provider.as_deref() == Some("parakeet");
-    let result = run_retranscription(app.clone(), meeting_id.clone(), meeting_folder_path, language, model, provider).await;
+    let result = run_retranscription(app.clone(), meeting_id.clone(), meeting_folder_path, language, model, provider, num_speakers).await;
 
     // Unload the engine after the batch job (success, failure, or cancellation)
     super::common::unload_engine_after_batch(use_parakeet).await;
@@ -177,6 +178,7 @@ async fn run_retranscription<R: Runtime>(
     language: Option<String>,
     model: Option<String>,
     provider: Option<String>,
+    num_speakers: Option<usize>,
 ) -> Result<RetranscriptionResult> {
     let folder_path = PathBuf::from(&meeting_folder_path);
     let audio_path = find_audio_file(&folder_path)?;
@@ -311,37 +313,30 @@ async fn run_retranscription<R: Runtime>(
         None
     };
 
-    // Split very long segments at silence boundaries for better transcription quality.
-    // Hard cuts at arbitrary sample positions lose words at boundaries. Instead, scan
-    // for the lowest-energy window near the target split point and cut there.
-    const MAX_SEGMENT_SAMPLES: usize = 25 * 16000; // 25 seconds at 16kHz
-
-    let mut processable_segments: Vec<crate::audio::vad::SpeechSegment> = Vec::new();
-    for segment in &speech_segments {
-        if segment.samples.len() > MAX_SEGMENT_SAMPLES {
-            debug!(
-                "Splitting large segment ({:.0}ms, {} samples) at silence boundaries",
-                segment.end_timestamp_ms - segment.start_timestamp_ms,
-                segment.samples.len()
-            );
-
-            let sub_segments = split_segment_at_silence(segment, MAX_SEGMENT_SAMPLES);
-            debug!("Split into {} sub-segments", sub_segments.len());
-            processable_segments.extend(sub_segments);
-        } else {
-            processable_segments.push(segment.clone());
-        }
-    }
+    emit_progress(&app, &meeting_id, "diarizing", 25, "Identifying speakers...");
+    let app_for_diarization = app.clone();
+    let meeting_id_for_diarization = meeting_id.clone();
+    let processable_segments = batch_speaker_pieces(&app, speech_segments, num_speakers, move |done, total| {
+        let percent = done * 100 / total.max(1);
+        emit_progress(
+            &app_for_diarization,
+            &meeting_id_for_diarization,
+            "diarizing",
+            25,
+            &format!("Identifying speakers... {}%", percent),
+        );
+        !RETRANSCRIPTION_CANCELLED.load(Ordering::SeqCst)
+    })
+    .await?;
 
     let processable_count = processable_segments.len();
-    info!("Processing {} segments (after splitting)", processable_count);
+    info!("Processing {} segments (after diarization and splitting)", processable_count);
 
     // Process each speech segment with progress updates
-    let mut speaker_tracker = batch_speaker_tracker(&app).await;
-    let mut all_transcripts: Vec<(String, f64, f64, Option<String>)> = Vec::new(); // (text, start_ms, end_ms)
+    let mut all_transcripts: Vec<(String, f64, f64, Option<String>)> = Vec::new(); // (text, start_ms, end_ms, speaker)
     let mut total_confidence = 0.0f32;
 
-    for (i, segment) in processable_segments.iter().enumerate() {
+    for (i, (segment, speaker)) in processable_segments.iter().enumerate() {
         // Check for cancellation before each segment
         if RETRANSCRIPTION_CANCELLED.load(Ordering::SeqCst) {
             return Err(anyhow!("Retranscription cancelled"));
@@ -394,7 +389,7 @@ async fn run_retranscription<R: Runtime>(
                 i + 1, processable_count, segment_duration_sec, conf,
                 if trimmed.len() > 80 { let mut end = 80; while !trimmed.is_char_boundary(end) { end -= 1; } &trimmed[..end] } else { trimmed }
             );
-            all_transcripts.push((text, segment.start_timestamp_ms, segment.end_timestamp_ms, Some(speaker_tracker.label_voice(&segment.samples))));
+            all_transcripts.push((text, segment.start_timestamp_ms, segment.end_timestamp_ms, speaker.clone()));
             total_confidence += conf;
         } else {
             debug!("Segment {}/{}: {:.1}s — empty transcription", i + 1, processable_count, segment_duration_sec);
@@ -420,16 +415,27 @@ async fn run_retranscription<R: Runtime>(
 
     emit_progress(&app, &meeting_id, "saving", 80, "Saving transcripts...");
 
-    // Create transcript segments with proper timestamps from VAD
-    let segments = create_transcript_segments(&all_transcripts);
-
     // Save to database
     let app_state = app
         .try_state::<AppState>()
         .ok_or_else(|| anyhow!("App state not available"))?;
+    let pool = app_state.db_manager.pool();
+
+    // Keep the live "Me" label (decided from the microphone) on the matching diarized speaker
+    let previous: Vec<(f64, f64, String)> = sqlx::query_as(
+        "SELECT audio_start_time, audio_end_time, speaker FROM transcripts
+         WHERE meeting_id = ? AND speaker IS NOT NULL AND audio_start_time IS NOT NULL AND audio_end_time IS NOT NULL",
+    )
+    .bind(&meeting_id)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| anyhow!("Failed to read existing transcripts: {}", e))?;
+    carry_over_me(&previous, &mut all_transcripts);
+
+    // Create transcript segments with proper timestamps from VAD
+    let segments = create_transcript_segments(&all_transcripts);
 
     // Wrap delete+insert+update in a transaction to prevent data loss
-    let pool = app_state.db_manager.pool();
     let mut conn = pool.acquire().await.map_err(|e| anyhow!("DB error: {}", e))?;
     let mut tx = sqlx::Connection::begin(&mut *conn)
         .await
@@ -787,6 +793,7 @@ pub async fn start_retranscription_command<R: Runtime>(
     language: Option<String>,
     model: Option<String>,
     provider: Option<String>,
+    num_speakers: Option<usize>,
 ) -> Result<RetranscriptionStarted, String> {
 
     // Check if retranscription is already in progress (guard will be acquired in start_retranscription)
@@ -806,6 +813,7 @@ pub async fn start_retranscription_command<R: Runtime>(
             language,
             model,
             provider,
+            num_speakers.filter(|&n| (1..=crate::audio::diarization::MAX_SPEAKERS).contains(&n)),
         )
         .await;
 

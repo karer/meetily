@@ -824,6 +824,8 @@ pub fn run() {
             // Retranscription commands
             audio::retranscription::start_retranscription_command,
             audio::retranscription::cancel_retranscription_command,
+            audio::speaker_tracker::get_speaker_model_status,
+            audio::speaker_tracker::download_speaker_model,
             audio::retranscription::is_retranscription_in_progress_command,
             // Import audio commands
             audio::import::select_and_validate_audio_command,

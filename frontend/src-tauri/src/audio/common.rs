@@ -8,7 +8,9 @@ use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
 use tauri::{AppHandle, Manager, Runtime};
 use uuid::Uuid;
 
-use super::speaker_tracker::{self, SpeakerTracker};
+use super::diarization;
+use super::speaker_tracker;
+use super::vad::SpeechSegment;
 
 static ENGINE_LIFECYCLE_LOCK: Lazy<Arc<AsyncMutex<()>>> =
     Lazy::new(|| Arc::new(AsyncMutex::new(())));
@@ -49,17 +51,102 @@ pub(crate) async fn unload_engine_after_batch(use_parakeet: bool) {
     }
 }
 
-/// Speaker tracker for a batch job; waits for the embedding model, which a
-/// batch can afford. Without it every segment is labelled "others".
-pub(crate) async fn batch_speaker_tracker<R: Runtime>(app: &AppHandle<R>) -> SpeakerTracker {
-    let Ok(dir) = app.path().app_data_dir() else {
-        return SpeakerTracker::new(Default::default());
+/// Segments longer than this are split at silence for better transcription quality.
+const MAX_SEGMENT_SAMPLES: usize = 25 * 16000; // 25 seconds at 16kHz
+
+/// Prepares a batch job's VAD segments for transcription: diarizes the whole
+/// recording into single-speaker pieces ("Speaker N"), then splits long pieces
+/// at silence. Without the embedding model the segments keep no speaker.
+/// `on_progress(done, total)` reports diarization progress; false cancels.
+pub(crate) async fn batch_speaker_pieces<R: Runtime>(
+    app: &AppHandle<R>,
+    segments: Vec<SpeechSegment>,
+    num_speakers: Option<usize>,
+    on_progress: impl FnMut(usize, usize) -> bool + Send + 'static,
+) -> Result<Vec<(SpeechSegment, Option<String>)>> {
+    let model = match app.path().app_data_dir() {
+        Ok(dir) => {
+            let path = speaker_tracker::model_path(&dir);
+            match speaker_tracker::ensure_model(&path).await {
+                Ok(()) => Some(path),
+                Err(e) => {
+                    log::warn!("Speaker embedding model unavailable, no speaker labels: {}", e);
+                    None
+                }
+            }
+        }
+        Err(e) => {
+            log::warn!("No app data dir, no speaker labels: {}", e);
+            None
+        }
     };
-    let path = speaker_tracker::model_path(&dir);
-    if let Err(e) = speaker_tracker::ensure_model(&path).await {
-        log::warn!("Speaker embedding model unavailable: {}", e);
+
+    let labelled: Vec<(SpeechSegment, Option<String>)> = match model {
+        Some(path) => tokio::task::spawn_blocking(move || -> Result<_> {
+            let mut extractor = match speaker_tracker::new_extractor(&path, 4) {
+                Ok(extractor) => extractor,
+                Err(e) => {
+                    log::warn!("Speaker embedding extractor unavailable, no speaker labels: {}", e);
+                    return Ok(segments.into_iter().map(|s| (s, None)).collect());
+                }
+            };
+            let pieces = diarization::diarize(&mut extractor, &segments, num_speakers, on_progress)?;
+            let speakers = pieces.iter().map(|p| p.speaker + 1).max().unwrap_or(0);
+            info!("Diarization: {} segments -> {} pieces, {} speakers", segments.len(), pieces.len(), speakers);
+            Ok(pieces
+                .into_iter()
+                .map(|p| (p.segment, Some(format!("Speaker {}", p.speaker + 1))))
+                .collect())
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("Diarization task panicked: {}", e))??,
+        None => segments.into_iter().map(|s| (s, None)).collect(),
+    };
+
+    Ok(labelled
+        .into_iter()
+        .flat_map(|(segment, speaker)| {
+            split_segment_at_silence(&segment, MAX_SEGMENT_SAMPLES)
+                .into_iter()
+                .map(move |s| (s, speaker.clone()))
+        })
+        .collect())
+}
+
+/// Gives the "Me" label of the replaced transcript (decided live from the
+/// microphone) to the diarized speaker that mostly overlaps it in time.
+/// `old` is (start_s, end_s, speaker); `new` is (text, start_ms, end_ms, speaker).
+pub(crate) fn carry_over_me(old: &[(f64, f64, String)], new: &mut [(String, f64, f64, Option<String>)]) {
+    let me: Vec<(f64, f64)> = old
+        .iter()
+        .filter(|(_, _, s)| s == speaker_tracker::SPEAKER_ME)
+        .map(|&(a, b, _)| (a * 1000.0, b * 1000.0))
+        .collect();
+    if me.is_empty() {
+        return;
     }
-    SpeakerTracker::new(path)
+    // speaker -> (total ms, ms overlapping old "Me")
+    let mut stats: std::collections::HashMap<String, (f64, f64)> = Default::default();
+    for (_, start, end, speaker) in new.iter() {
+        let Some(speaker) = speaker else { continue };
+        let overlap: f64 = me.iter().map(|&(a, b)| (end.min(b) - start.max(a)).max(0.0)).sum();
+        let entry = stats.entry(speaker.clone()).or_default();
+        entry.0 += end - start;
+        entry.1 += overlap;
+    }
+    let best = stats
+        .iter()
+        .filter(|(_, (total, overlap))| *overlap > 0.5 * total)
+        .max_by(|a, b| a.1 .1.total_cmp(&b.1 .1))
+        .map(|(speaker, _)| speaker.clone());
+    if let Some(best) = best {
+        info!("Diarized {} matches the live \"Me\" label", best);
+        for (_, _, _, speaker) in new.iter_mut() {
+            if speaker.as_deref() == Some(best.as_str()) {
+                *speaker = Some(speaker_tracker::SPEAKER_ME.to_string());
+            }
+        }
+    }
 }
 
 /// Create transcript segments from transcription results.
@@ -232,6 +319,27 @@ pub(crate) fn split_segment_at_silence(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn row(start_ms: f64, end_ms: f64, speaker: &str) -> (String, f64, f64, Option<String>) {
+        (String::new(), start_ms, end_ms, Some(speaker.to_string()))
+    }
+
+    #[test]
+    fn me_moves_to_the_overlapping_speaker() {
+        let old = vec![(0.0, 10.0, "Me".to_string()), (10.0, 20.0, "Speaker 1".to_string())];
+        let mut new = vec![row(0.0, 9000.0, "Speaker 2"), row(9000.0, 20000.0, "Speaker 1"), row(20000.0, 25000.0, "Speaker 2")];
+        carry_over_me(&old, &mut new);
+        let speakers: Vec<_> = new.iter().map(|r| r.3.clone().unwrap()).collect();
+        assert_eq!(speakers, vec!["Me", "Speaker 1", "Me"]);
+    }
+
+    #[test]
+    fn me_needs_majority_overlap() {
+        let old = vec![(0.0, 2.0, "Me".to_string())];
+        let mut new = vec![row(0.0, 10000.0, "Speaker 1")];
+        carry_over_me(&old, &mut new);
+        assert_eq!(new[0].3.as_deref(), Some("Speaker 1"));
+    }
 
     #[tokio::test]
     async fn test_engine_lifecycle_lock_serializes_acquirers() {

@@ -25,7 +25,7 @@ function MeetingDetailsContent() {
   const meetingId = searchParams.get('id');
   const source = searchParams.get('source'); // Check if navigated from recording
   const { setCurrentMeeting, refetchMeetings } = useSidebar();
-  const { isAutoSummary } = useConfig(); // Get auto-summary toggle state
+  const { isAutoSummary, isAutoRetranscribe, betaFeatures } = useConfig(); // Get auto-summary toggle state
   const router = useRouter();
   const [meetingDetails, setMeetingDetails] = useState<MeetingDetailsResponse | null>(null);
   const [summaryResponse, setSummaryResponse] = useState<SummaryProcessResponse | null>(null);
@@ -34,6 +34,7 @@ function MeetingDetailsContent() {
   const [isLoading, setIsLoading] = useState<boolean>(true);
   const [shouldAutoGenerate, setShouldAutoGenerate] = useState<boolean>(false);
   const [hasCheckedAutoGen, setHasCheckedAutoGen] = useState<boolean>(false);
+  const [autoRetranscribeDone, setAutoRetranscribeDone] = useState<boolean>(false);
 
   // Use pagination hook for efficient transcript loading
   const {
@@ -270,12 +271,18 @@ function MeetingDetailsContent() {
     </div>;
   }
 
+  // Right after a recording: full retranscription (speaker diarization) first, auto summary after it
+  const autoRetranscribe = source === 'recording' && isAutoRetranscribe && betaFeatures.importAndRetranscribe
+    && !!meetingDetails.folder_path && !autoRetranscribeDone;
+
   return <PageContent
     key={meetingId}
     initialSummary={summaryResponse}
     meeting={meetingDetails}
     summaryData={meetingSummary}
-    shouldAutoGenerate={shouldAutoGenerate}
+    shouldAutoGenerate={shouldAutoGenerate && !autoRetranscribe}
+    autoRetranscribe={autoRetranscribe}
+    onAutoRetranscribeDone={() => setAutoRetranscribeDone(true)}
     onAutoGenerateComplete={() => setShouldAutoGenerate(false)}
     onMeetingUpdated={async () => {
       // Refetch meeting details to get updated title from backend

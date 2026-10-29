@@ -13,6 +13,7 @@ import {
   ChevronDown,
   ChevronUp,
 } from 'lucide-react';
+import { SpeakerCountSelect, toNumSpeakers } from '../SpeakerCountSelect';
 import {
   Dialog,
   DialogContent,
@@ -76,6 +77,7 @@ export function ImportAudioDialog({
 
   const [title, setTitle] = useState('');
   const [selectedLang, setSelectedLang] = useState(selectedLanguage || 'auto');
+  const [selectedSpeakers, setSelectedSpeakers] = useState('auto');
   const [showAdvanced, setShowAdvanced] = useState(false);
   const [titleModifiedByUser, setTitleModifiedByUser] = useState(false);
 
@@ -138,6 +140,7 @@ export function ImportAudioDialog({
       setTitle('');
       setTitleModifiedByUser(false);
       setSelectedLang(selectedLanguage || 'auto');
+      setSelectedSpeakers('auto');
       setShowAdvanced(false);
 
       // Validate preselected file if provided
@@ -192,7 +195,8 @@ export function ImportAudioDialog({
       title || fileInfo.filename,
       isParakeetModel ? null : selectedLang === 'auto' ? null : selectedLang,
       selectedModel?.name || null,
-      selectedModel?.provider || null
+      selectedModel?.provider || null,
+      toNumSpeakers(selectedSpeakers)
     );
   };
 
@@ -402,6 +406,8 @@ export function ImportAudioDialog({
                           </Select>
                         </div>
                       )}
+
+                      <SpeakerCountSelect value={selectedSpeakers} onChange={setSelectedSpeakers} />
                     </div>
                   )}
                 </div>

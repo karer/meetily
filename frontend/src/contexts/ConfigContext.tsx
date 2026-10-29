@@ -77,6 +77,10 @@ interface ConfigContextType {
   isAutoSummary: boolean;
   toggleIsAutoSummary: (checked: boolean) => void;
 
+  // Full retranscription (with speaker diarization) right after a recording stops
+  isAutoRetranscribe: boolean;
+  toggleIsAutoRetranscribe: (checked: boolean) => void;
+
   // Provider-specific API keys
   providerApiKeys: {
     claude: string | null;
@@ -164,6 +168,14 @@ export function ConfigProvider({ children }: { children: ReactNode }) {
       return saved !== null ? saved === 'true' : false
     }
     return false;
+  });
+
+  const [isAutoRetranscribe, setIsAutoRetranscribe] = useState<boolean>(() => {
+    if (typeof window !== 'undefined') {
+      const saved = localStorage.getItem('isAutoRetranscribe');
+      return saved !== null ? saved === 'true' : true;
+    }
+    return true;
   });
 
   // Beta features state (localStorage)
@@ -394,6 +406,13 @@ export function ConfigProvider({ children }: { children: ReactNode }) {
     }
   }, [])
 
+  const toggleIsAutoRetranscribe = useCallback((checked: boolean) => {
+    setIsAutoRetranscribe(checked);
+    if (typeof window !== 'undefined') {
+      localStorage.setItem('isAutoRetranscribe', checked.toString());
+    }
+  }, [])
+
   // Toggle beta feature with localStorage persistence and analytics
   const toggleBetaFeature = useCallback((featureKey: BetaFeatureKey, enabled: boolean) => {
     setBetaFeatures(prev => {
@@ -493,6 +512,8 @@ export function ConfigProvider({ children }: { children: ReactNode }) {
     isModelConfigLoading,
     isAutoSummary,
     toggleIsAutoSummary,
+    isAutoRetranscribe,
+    toggleIsAutoRetranscribe,
     providerApiKeys,
     updateProviderApiKey,
     transcriptModelConfig,
@@ -518,6 +539,8 @@ export function ConfigProvider({ children }: { children: ReactNode }) {
     isModelConfigLoading,
     isAutoSummary,
     toggleIsAutoSummary,
+    isAutoRetranscribe,
+    toggleIsAutoRetranscribe,
     providerApiKeys,
     updateProviderApiKey,
     transcriptModelConfig,

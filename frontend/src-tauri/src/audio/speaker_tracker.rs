@@ -3,8 +3,8 @@
 //! Mic and system audio are captured as separate streams, so every VAD segment
 //! carries both sources (see `SourceAudio`). A segment where the microphone
 //! dominates is labelled "Me". Remote speech is split into "Speaker N" by
-//! clustering voice embeddings computed with sherpa-onnx and the WeSpeaker
-//! ResNet34-LM model (the embedding model used by pyannote 3.x).
+//! clustering voice embeddings computed with sherpa-onnx and the 3D-Speaker
+//! CAM++ model. Batch jobs use the same model through `diarization`.
 //!
 //! Without the embedding model, remote speech falls back to "Others".
 //! Labels are stored as display text, so renaming a speaker is a plain text update.
@@ -19,9 +19,11 @@ use sherpa_rs::speaker_id::{EmbeddingExtractor, ExtractorConfig};
 pub const SPEAKER_ME: &str = "Me";
 pub const SPEAKER_OTHERS: &str = "Others";
 
-const MODEL_FILE: &str = "wespeaker_en_voxceleb_resnet34_LM.onnx";
-const MODEL_URL: &str = "https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-recongition-models/wespeaker_en_voxceleb_resnet34_LM.onnx";
-const MODEL_SHA256: &str = "e9848563da86f263117134dfd7ad63c92355b37de492b55e325400c9d9c39012";
+/// Shown in settings; the settings card reads it from here so the UI names the model in use.
+const MODEL_NAME: &str = "3D-Speaker CAM++ (zh/en, advanced)";
+const MODEL_FILE: &str = "3dspeaker_speech_campplus_sv_zh_en_16k-common_advanced.onnx";
+const MODEL_URL: &str = "https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-recongition-models/3dspeaker_speech_campplus_sv_zh_en_16k-common_advanced.onnx";
+const MODEL_SHA256: &str = "aa3cfc16963a10586a9393f5035d6d6b57e98d358b347f80c2a30bf4f00ceba2";
 
 pub const SOURCE_SAMPLE_RATE: u32 = 16000;
 /// 30ms frames at 16kHz, same granularity as the VAD.
@@ -34,10 +36,11 @@ const DOMINANCE_RATIO: f32 = 2.0;
 /// Below this, embeddings are unreliable and the previous remote speaker is reused.
 const MIN_EMBEDDING_SAMPLES: usize = SOURCE_SAMPLE_RATE as usize;
 const MAX_EMBEDDING_SAMPLES: usize = SOURCE_SAMPLE_RATE as usize * 20;
-/// Cosine similarity needed to join an existing speaker. Measured on distinct
-/// voices: same voice 0.93-0.97, different voices 0.32-0.77. Erring high splits
+/// Cosine similarity needed to join an existing speaker. Replaying a 3-speaker
+/// meeting through this tracker: 0.4 gave the 3 voices as the 3 large clusters
+/// at 97.7% purity; 0.5 and above split them into dozens. Erring high splits
 /// one person into two, which renaming merges; erring low merges two people.
-const SIMILARITY_THRESHOLD: f32 = 0.8;
+const SIMILARITY_THRESHOLD: f32 = 0.4;
 
 /// Per-source audio of one VAD segment: 16kHz mono, sample-aligned.
 #[derive(Debug, Clone)]
@@ -76,6 +79,37 @@ pub async fn ensure_model(path: &Path) -> anyhow::Result<()> {
     tokio::fs::rename(&partial, path).await?;
     info!("Speaker embedding model ready ({} bytes)", bytes.len());
     Ok(())
+}
+
+/// Speaker model status for the settings card.
+#[derive(Debug, serde::Serialize)]
+pub struct SpeakerModelStatus {
+    pub name: &'static str,
+    pub file: &'static str,
+    pub downloaded: bool,
+    pub size_bytes: Option<u64>,
+}
+
+fn model_status(path: &Path) -> SpeakerModelStatus {
+    let size_bytes = std::fs::metadata(path).ok().map(|m| m.len());
+    SpeakerModelStatus { name: MODEL_NAME, file: MODEL_FILE, downloaded: size_bytes.is_some(), size_bytes }
+}
+
+fn app_model_path<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> Result<PathBuf, String> {
+    use tauri::Manager;
+    app.path().app_data_dir().map(|dir| model_path(&dir)).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn get_speaker_model_status<R: tauri::Runtime>(app: tauri::AppHandle<R>) -> Result<SpeakerModelStatus, String> {
+    Ok(model_status(&app_model_path(&app)?))
+}
+
+#[tauri::command]
+pub async fn download_speaker_model<R: tauri::Runtime>(app: tauri::AppHandle<R>) -> Result<SpeakerModelStatus, String> {
+    let path = app_model_path(&app)?;
+    ensure_model(&path).await.map_err(|e| e.to_string())?;
+    Ok(model_status(&path))
 }
 
 struct Cluster {
@@ -162,13 +196,7 @@ impl SpeakerTracker {
     /// Loads the extractor lazily: the model may still be downloading when recording starts.
     fn extractor(&mut self) -> Option<&mut EmbeddingExtractor> {
         if self.extractor.is_none() && !self.extractor_failed && self.model_path.exists() {
-            let config = ExtractorConfig {
-                model: self.model_path.to_string_lossy().into_owned(),
-                provider: Some("cpu".to_string()),
-                num_threads: Some(2),
-                debug: false,
-            };
-            match EmbeddingExtractor::new(config) {
+            match new_extractor(&self.model_path, 2) {
                 Ok(extractor) => {
                     info!("Speaker embedding extractor loaded");
                     self.extractor = Some(extractor);
@@ -181,6 +209,16 @@ impl SpeakerTracker {
         }
         self.extractor.as_mut()
     }
+}
+
+pub fn new_extractor(model_path: &Path, num_threads: usize) -> anyhow::Result<EmbeddingExtractor> {
+    let config = ExtractorConfig {
+        model: model_path.to_string_lossy().into_owned(),
+        provider: Some("cpu".to_string()),
+        num_threads: Some(num_threads),
+        debug: false,
+    };
+    EmbeddingExtractor::new(config).map_err(|e| anyhow::anyhow!("{}", e))
 }
 
 /// Frame-level vote: each active 30ms frame goes to the clearly louder source.

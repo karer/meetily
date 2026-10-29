@@ -5,6 +5,7 @@ pub mod encode;
 pub mod ffmpeg;
 pub mod vad;
 pub mod speaker_tracker;
+pub mod diarization;
 
 // Modularized device management
 pub mod devices;
